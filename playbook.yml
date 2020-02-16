@@ -1,0 +1,88 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: 'dev'
+    project: 'cicd'
+    jenkins_subdomain: 'jenkins'
+    naked_domain: '<<YOUR_SITE.COM>>'
+    vpc_stack: '<<YOUR_VPC_CLOUDFORMATION_STACK>>'
+    vpn_stack: '<<YOUR_VPN_CLOUDFORMATION_STACK>>'
+  tasks:
+    - name: Get Naked Domain Hosted Zone Information
+      shell: |
+        aws route53 list-hosted-zones-by-name --max-items 1 --dns-name {{ naked_domain }}.
+      tags:
+        - cicd
+      register: hosted_zone_information
+    - name: Extract Naked Domain Hosted Zone Id
+      set_fact:
+        hosted_zone_id: "{{ ( hosted_zone_information['stdout'] | from_json )['HostedZones'][0]['Id'] | replace('/hostedzone/','') }}"
+      tags:
+        - cicd
+    - name: Cloudformation ACM Certificate Deploy
+      cloudformation:
+        stack_name: '{{ project }}-certificate-{{ env }}'
+        state: present
+        template: templates/certificate.yaml
+        template_parameters:
+          Project: '{{ project }}'
+          Environment: '{{ env }}'
+          DomainName: '{{ jenkins_subdomain }}.{{ naked_domain }}'
+        tags:
+          'project': '{{ project }}'
+          'environment': '{{ env }}'
+      register: certificate_stack
+      tags:
+        - cicd
+    - name: Cloudformation ECS Deploy
+      cloudformation:
+        stack_name: '{{ project }}-ecs-{{ env }}'
+        state: present
+        template: templates/ecs.yaml
+        template_parameters:
+          Project: '{{ project }}'
+          Environment: '{{ env }}'
+          VpcStack: '{{ vpc_stack }}'
+          VpnStack: '{{ vpn_stack }}'
+        tags:
+          'project': '{{ project }}'
+          'environment': '{{ env }}'
+      register: ecs_stack
+      tags:
+        - cicd
+    - name: Cloudformation Jenkins Master Deploy
+      cloudformation:
+        stack_name: '{{ project }}-jenkins-master-{{ env }}'
+        state: present
+        template: templates/jenkins-master.yaml
+        template_parameters:
+          Project: '{{ project }}'
+          Environment: '{{ env }}'
+          VpcStack: '{{ vpc_stack }}'
+          VpnStack: '{{ vpn_stack }}'
+          EcsStack: '{{ecs_stack.stack_outputs.StackName }}'
+          CertificateStack: '{{ certificate_stack.stack_outputs.StackName }}'
+          DomainHostedZone: '{{ hosted_zone_id }}'
+          DomainName: '{{ jenkins_subdomain }}.{{ naked_domain }}'
+        tags:
+          'project': '{{ project }}'
+          'environment': '{{ env }}'
+      register: jenkins_master_stack
+      tags:
+        - cicd
+    - name: Cloudformation Jenkins Slave Definitions Deploy
+      cloudformation:
+        stack_name: '{{ project }}-jenkins-slaves-{{ env }}'
+        state: present
+        template: templates/jenkins-slaves.yaml
+        template_parameters:
+          Project: '{{ project }}'
+          Environment: '{{ env }}'
+          JenkinsMasterStack: '{{jenkins_master_stack.stack_outputs.StackName }}'
+        tags:
+          'project': '{{ project }}'
+          'environment': '{{ env }}'
+      register: jenkins_slaves_stack
+      tags:
+        - cicd
+

@@ -1,0 +1,398 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Resources related to the Jenkins Master ECS Service, Load Balancers, etc'
+Parameters:
+  Project:
+    Description: 'Descriptive name that is used for Tags'
+    Type: String
+    Default: cicd
+  Environment:
+    Description: 'The environment of the resources, e.g dev'
+    Type: String
+    Default: dev
+  VpcStack:
+    Description: 'The parent VPC Stack'
+    Type: String
+  EcsStack:
+    Description: 'The ECS Stack'
+    Type: String
+  BastionHostStack:
+    Description: 'The Bastion Host Stack'
+    Type: String
+    Default: ''
+  VpnStack:
+    Description: 'The Vpn Stack'
+    Type: String
+    Default: ''
+  JenkinsMasterJnlpPort:
+    Description: 'The default Jenkins JNLP that agents will connect to'
+    Type: 'Number'
+    Default: 50000
+  SubnetType:
+    Type: String
+    Default: Private
+    AllowedValues:
+      - Private
+      - Public
+    Description: The subnet type to launch Load Balancers on (public or private)
+  PublicCidr:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR range that can access the Load Balancers is the subnet type is public
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+  CertificateStack:
+    Description: 'Optional Stack that contains an AWS ACM to associate with the load balancer.'
+    Type: String
+    Default: ''
+  DomainHostedZone:
+    Type: String
+    Description: Optional Hosted Zone Id
+    Default: ''
+  DomainName:
+    Type: String
+    Description: Valid Domain Name to link Application Load Balancer to
+    Default: ''
+Conditions:
+  HasBastionSecurityGroup: !Not [!Equals [!Ref BastionHostStack, '']]
+  HasVpnSecurityGroup: !Not [!Equals [!Ref VpnStack, '']]
+  Internal: !Equals [!Ref SubnetType, 'Private']
+  Public: !Equals [!Ref SubnetType, 'Public']
+  HasCertificateStack: !Not [!Equals [!Ref CertificateStack, '']]
+  PublicAndHasCertificateStack: !And [!Condition Public, !Condition HasCertificateStack]
+  CreateDomain: !And [!Not [!Equals [!Ref DomainHostedZone, '']], !Not [!Equals [!Ref DomainName, '']]]
+Resources:
+  EcsSecurityGroupIngressFromVpcJenkinsJnlpPort:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from VPC to Jenkins Master JnlpPort to Allow for NLB Health Checks
+      GroupId: !ImportValue
+        "Fn::Sub": '${EcsStack}-SecurityGroup'
+      IpProtocol: 'tcp'
+      FromPort: !Ref JenkinsMasterJnlpPort
+      ToPort: !Ref JenkinsMasterJnlpPort
+      CidrIp: !ImportValue
+          "Fn::Sub": ${VpcStack}-CidrBlock
+
+  EcsSecurityGroupIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the private ALB to serve Web traffic from the Jenkins master service
+      GroupId: !ImportValue
+        "Fn::Sub": '${EcsStack}-SecurityGroup'
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref JenkinsApplicationLoadBalancerSG
+
+  JenkinsEcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      RoleName: !Sub '${Project}-iam-role-ecs-task-execution-${Environment}'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  JenkinsCwLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub '${Project}-jenkins-${Environment}'
+      RetentionInDays: 7
+
+  JenkinsEcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+        RoleName: !Sub '${Project}-iam-role-ecs-task-jenkins-${Environment}'
+        Path: /
+        AssumeRolePolicyDocument:
+            Version: 2012-10-17
+            Statement:
+                - Effect: Allow
+                  Principal:
+                      Service:
+                          - ecs-tasks.amazonaws.com
+                  Action: sts:AssumeRole
+        Policies:
+            - PolicyName: !Sub ecs-${AWS::StackName}
+              PolicyDocument:
+                  Version: "2012-10-17"
+                  Statement:
+                      - Action:
+                            - "ecs:RegisterTaskDefinition"
+                            - "ecs:ListClusters"
+                            - "ecs:DescribeContainerInstances"
+                            - "ecs:ListTaskDefinitions"
+                            - "ecs:DescribeTaskDefinition"
+                            - "ecs:DeregisterTaskDefinition"
+                        Effect: Allow
+                        Resource: "*"
+                      - Action:
+                            - "ecs:ListContainerInstances"
+                        Effect: Allow
+                        Resource:
+                            - Fn::Sub:
+                              - "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ECSCluster}"
+                              - ECSCluster: {'Fn::ImportValue': !Sub '${EcsStack}-EcsCluster'}
+                      - Action:
+                            - "ecs:RunTask"
+                        Effect: Allow
+                        Condition:
+                            ArnEquals:
+                                ecs:cluster:
+                                    - Fn::Sub:
+                                      - "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ECSCluster}"
+                                      - ECSCluster: {'Fn::ImportValue': !Sub '${EcsStack}-EcsCluster'}
+                        Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/*"
+                      - Action:
+                            - "ecs:StopTask"
+                        Effect: Allow
+                        Condition:
+                            ArnEquals:
+                                ecs:cluster:
+                                    - Fn::Sub:
+                                      - "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ECSCluster}"
+                                      - ECSCluster: {'Fn::ImportValue': !Sub '${EcsStack}-EcsCluster'}
+                        Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/*"
+                      - Action:
+                            - "ecs:DescribeTasks"
+                        Effect: Allow
+                        Condition:
+                            ArnEquals:
+                                ecs:cluster:
+                                    - Fn::Sub:
+                                      - "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ECSCluster}"
+                                      - ECSCluster: {'Fn::ImportValue': !Sub '${EcsStack}-EcsCluster'}
+                        Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/*"
+
+  JenkinsEcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${Project}-jenkins-${Environment}'
+      ExecutionRoleArn: !GetAtt 'JenkinsEcsTaskExecutionRole.Arn'
+      TaskRoleArn: !Ref JenkinsEcsTaskRole
+      ContainerDefinitions:
+        - Name: jenkins
+          Hostname: jenkins
+          Image: jenkins/jenkins:lts
+          Environment:
+            - Name: JENKINS_SLAVE_AGENT_PORT
+              Value: !Ref JenkinsMasterJnlpPort
+          Essential: true
+          Cpu: 1024
+          Memory: 983
+          MountPoints:
+            - ContainerPath: /var/jenkins_home/
+              SourceVolume: jenkins_home
+          PortMappings:
+            - ContainerPort: 8080
+            - ContainerPort: !Ref JenkinsMasterJnlpPort
+              HostPort: !Ref JenkinsMasterJnlpPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref JenkinsCwLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: jenkins
+      Volumes:
+        - Name: jenkins_home
+          Host:
+            SourcePath: /mnt/efs/
+
+  JenkinsApplicationLoadBalancerSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${Project}-alb-sg-${Environment}'
+      Tags:
+      - Key: Name
+        Value: !Sub '${Project}-alb-sg-${Environment}'
+      GroupDescription: ALB Security Group
+      VpcId: !ImportValue
+          "Fn::Sub": ${VpcStack}-VPC
+
+  JenkinsApplicationLoadBalancerSGInBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasBastionSecurityGroup
+    Properties:
+      Description: Ingress from the Bastion Host
+      GroupId: !Ref JenkinsApplicationLoadBalancerSG
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !ImportValue
+        "Fn::Sub": '${BastionHostStack}-SecurityGroup'
+
+  JenkinsApplicationLoadBalancerSGInVpn:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasVpnSecurityGroup
+    Properties:
+      Description: Ingress from the Vpn
+      GroupId: !Ref JenkinsApplicationLoadBalancerSG
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !ImportValue
+        "Fn::Sub": '${VpnStack}-SecurityGroup'
+
+  JenkinsApplicationLoadBalancerSGGroupInFromECS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: 'Ingress from the ECS host to allow Worker agents to communicate'
+      GroupId: !Ref JenkinsApplicationLoadBalancerSG
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !ImportValue
+        "Fn::Sub": '${EcsStack}-SecurityGroup'
+
+  JenkinsApplicationLoadBalancerSGGroupInHttpWorld:
+    Condition: Public
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref JenkinsApplicationLoadBalancerSG
+      IpProtocol: 'tcp'
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref PublicCidr
+
+  JenkinsApplicationLoadBalancerSGGroupInHttpsWorld:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Condition: PublicAndHasCertificateStack
+    Properties:
+      GroupId: !Ref JenkinsApplicationLoadBalancerSG
+      IpProtocol: 'tcp'
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref PublicCidr
+
+  JenkinsApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: 
+      Name: !Sub '${Project}-alb-${Environment}'
+      Scheme: !If [Internal, 'internal', 'internet-facing']
+      SecurityGroups: 
+        - !Ref JenkinsApplicationLoadBalancerSG
+      Subnets: !Split [',', 'Fn::ImportValue': !Sub '${VpcStack}-Subnets${SubnetType}']
+
+  JenkinsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Project}-jenkins-web-tg-${Environment}'
+      HealthCheckIntervalSeconds: 120
+      HealthCheckPath: '/login'
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200-299'
+      TargetGroupAttributes:
+      - Key: 'deregistration_delay.timeout_seconds'
+        Value: '30'
+      Port: 80
+      Protocol: HTTP
+      VpcId: {'Fn::ImportValue': !Sub '${VpcStack}-VPC'}
+
+  JenkinsAlbHttpListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref JenkinsTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref JenkinsApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  JenkinsAlbHttpsListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Condition: HasCertificateStack
+    Properties:
+      Certificates:
+      - CertificateArn: !ImportValue
+          "Fn::Sub": ${CertificateStack}-Certificate
+      DefaultActions:
+      - TargetGroupArn: !Ref JenkinsTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref JenkinsApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+
+  JenkinsNetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: 
+      Name: !Sub '${Project}-nlb-${Environment}'
+      Type: network
+      Scheme: !If [Internal, 'internal', 'internet-facing']
+      Subnets: !Split [',', 'Fn::ImportValue': !Sub '${VpcStack}-Subnets${SubnetType}']
+
+  JenkinsJnlpTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Project}-jenkins-jnlp-tg-${Environment}'
+      HealthCheckPath: '/'
+      HealthCheckProtocol: HTTP
+      Port: !Ref JenkinsMasterJnlpPort
+      Protocol: TCP
+      VpcId: {'Fn::ImportValue': !Sub '${VpcStack}-VPC'}
+
+  JenkinsJnlpListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref JenkinsJnlpTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref JenkinsNetworkLoadBalancer
+      Port: !Ref JenkinsMasterJnlpPort
+      Protocol: TCP
+
+  JenkinsECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+        - JenkinsAlbHttpListener
+        - JenkinsJnlpListener
+    Properties:
+      ServiceName: !Sub '${Project}-jenkins-${Environment}'
+      Cluster: !ImportValue
+        "Fn::Sub": '${EcsStack}-EcsCluster'
+      DesiredCount: 1
+      LoadBalancers:
+        - ContainerName: jenkins
+          ContainerPort: 8080
+          TargetGroupArn: !Ref JenkinsTargetGroup
+        - ContainerName: jenkins
+          ContainerPort: !Ref JenkinsMasterJnlpPort
+          TargetGroupArn: !Ref JenkinsJnlpTargetGroup
+      TaskDefinition: !Ref JenkinsEcsTaskDefinition
+
+  JenkinsApplicationRecordSet:
+    Condition: CreateDomain
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      AliasTarget:
+        HostedZoneId: !GetAtt 'JenkinsApplicationLoadBalancer.CanonicalHostedZoneID'
+        DNSName: !GetAtt 'JenkinsApplicationLoadBalancer.DNSName'
+      HostedZoneId: !Ref DomainHostedZone
+      Name: !Ref DomainName
+      Type: A
+
+Outputs:
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'
+  ApplicationDNSName:
+    Description: 'The DNS name for the Jenkins Master ALB.'
+    Value: !GetAtt 'JenkinsApplicationLoadBalancer.DNSName'
+    Export:
+      Name: !Sub '${AWS::StackName}-DNSName'
+  ApplicationURL:
+    Description: 'URL to the Jenkins Master ALB.'
+    Value: !Sub 'http://${JenkinsApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-URL'
+  NetworkDNSName:
+    Description: 'The DNS name for the Jenkins Master Network Load Balancer.'
+    Value: !GetAtt 'JenkinsNetworkLoadBalancer.DNSName'
+    Export:
+      Name: !Sub '${AWS::StackName}-NetworkDNSName'
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for ECS Task Logging'
+    Value: !Ref 'JenkinsCwLogGroup'
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'

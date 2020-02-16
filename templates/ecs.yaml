@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ''
+Parameters:
+  Project:
+    Description: 'Descriptive name that is used for Tags'
+    Type: String
+    Default: cicd
+  Environment:
+    Description: 'The environment of the resources, e.g dev'
+    Type: String
+    Default: dev
+  VpcStack:
+    Description: 'The parent VPC Stack'
+    Type: String
+  BastionHostStack:
+    Description: 'The Bastion Host Stack'
+    Type: String
+    Default: ''
+  VpnStack:
+    Description: 'The Vpn Stack'
+    Type: String
+    Default: ''
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues: [t2.micro, t2.small, t2.medium, t2.large, m3.medium, m3.large,
+      m3.xlarge, m3.2xlarge, m4.large, m4.xlarge, m4.2xlarge, m4.4xlarge, m4.10xlarge,
+      c4.large, c4.xlarge, c4.2xlarge, c4.4xlarge, c4.8xlarge, c3.large, c3.xlarge,
+      c3.2xlarge, c3.4xlarge, c3.8xlarge, r3.large, r3.xlarge, r3.2xlarge, r3.4xlarge,
+      r3.8xlarge, i2.xlarge, i2.2xlarge, i2.4xlarge, i2.8xlarge]
+  SubnetType:
+    Type: String
+    Default: Private
+    AllowedValues:
+      - Private
+      - Public
+    Description: The subnet type to launch the ECS hosts on (public or private)
+Mappings:
+  RegionMap:
+    ap-northeast-1: 
+      AmazonLinux2: ami-08798a629a97d8551
+    ap-northeast-2: 
+      AmazonLinux2: ami-01dbce8fc02bec9ba
+    ap-south-1: 
+      AmazonLinux2: ami-055c242d89deb39da
+    ap-southeast-1: 
+      AmazonLinux2: ami-0310a9b646b817d26
+    ap-southeast-2: 
+      AmazonLinux2: ami-0adc350d7c7a2259f
+    ca-central-1: 
+      AmazonLinux2: ami-08decf7a4d56cff6e
+    eu-central-1: 
+      AmazonLinux2: ami-01933d3dbcb8f63e0
+    eu-west-1: 
+      AmazonLinux2: ami-027078d981e5d4010
+    eu-west-2: 
+      AmazonLinux2: ami-0749bd3fac17dc2cc
+    sa-east-1: 
+      AmazonLinux2: ami-076ade7c122b5607b
+    us-east-1: 
+      AmazonLinux2: ami-00afc256a955c31b5
+    us-east-2: 
+      AmazonLinux2: ami-01a7c6aed63b6014f
+    us-west-1: 
+      AmazonLinux2: ami-01b3329a1f446d6aa
+    us-west-2: 
+      AmazonLinux2: ami-0cbd7a68124b9cff9
+Conditions:
+  HasBastionSecurityGroup: !Not [!Equals [!Ref BastionHostStack, '']]
+  HasVpnSecurityGroup: !Not [!Equals [!Ref VpnStack, '']]
+Resources:
+  EfsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default-1
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !Join 
+                - ''
+                - - 'arn:aws:iam::'
+                  - !Ref 'AWS::AccountId'
+                  - ':root'
+            Action:
+              - 'kms:*'
+            Resource: '*'
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      Encrypted: True 
+      KmsKeyId: !GetAtt EfsKey.Arn
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-efs-sg-${Environment}'
+      Tags:
+      - Key: Name
+        Value: !Sub '${Project}-efs-sg-${Environment}'
+      GroupDescription: Enable NFS access from EC2
+      SecurityGroupIngress:
+        - FromPort: 2049
+          IpProtocol: 'tcp'
+          ToPort: 2049
+          SourceSecurityGroupId: !GetAtt 'EcsHostSecurityGroup.GroupId'
+      VpcId: !ImportValue
+          "Fn::Sub": ${VpcStack}-VPC
+
+  EfsMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'EfsFileSystem'
+      SecurityGroups:
+        - !GetAtt 'EfsSecurityGroup.GroupId'
+      SubnetId: !ImportValue
+          "Fn::Sub": ${VpcStack}-SubnetA${SubnetType}
+
+  EfsMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'EfsFileSystem'
+      SecurityGroups:
+        - !GetAtt 'EfsSecurityGroup.GroupId'
+      SubnetId: !ImportValue
+          "Fn::Sub": ${VpcStack}-SubnetB${SubnetType}
+
+  EfsMountTargetC:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'EfsFileSystem'
+      SecurityGroups:
+        - !GetAtt 'EfsSecurityGroup.GroupId'
+      SubnetId: !ImportValue
+          "Fn::Sub": ${VpcStack}-SubnetC${SubnetType}
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties: 
+      ClusterName: !Sub '${Project}-ecs-${Environment}'
+      Tags:
+      - Key: Name
+        Value: !Sub '${Project}-ecs-${Environment}'
+
+  EcsHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Project}-ecs-sg-${Environment}'
+      GroupDescription: Access to the ECS hosts that run containers
+      VpcId: !ImportValue
+          "Fn::Sub": ${VpcStack}-VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${Project}-ecs-sg-${Environment}'
+
+  EcsSecurityGroupIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from other containers in the same security group
+      GroupId: !Ref 'EcsHostSecurityGroup'
+      SourceSecurityGroupId: !Ref EcsHostSecurityGroup
+      IpProtocol: '-1'
+
+  EcsHostSecurityGroupInBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasBastionSecurityGroup
+    Properties:
+      Description: Ingress from the Bastion Host
+      GroupId: !Ref EcsHostSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !ImportValue
+        "Fn::Sub": '${BastionHostStack}-SecurityGroup'
+
+  EcsHostSecurityGroupInVpn:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasVpnSecurityGroup
+    Properties:
+      Description: Ingress from the Vpn
+      GroupId: !Ref EcsHostSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !ImportValue
+        "Fn::Sub": '${VpnStack}-SecurityGroup'
+
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      RoleName: !Sub '${Project}-iam-role-ecs-${Environment}'
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ec2.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/'
+      Roles:
+        - !Ref EcsInstanceRole
+
+  EcsLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      LaunchConfigurationName: !Sub '${Project}-ecs-lc-${Environment}'
+      ImageId: !FindInMap [ RegionMap, !Ref "AWS::Region", AmazonLinux2 ]
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EcsInstanceProfile
+      SecurityGroups:
+        - !Ref EcsHostSecurityGroup
+      UserData:
+        "Fn::Base64": !Sub |
+            #!/bin/bash
+            yum update -y
+            echo ECS_CLUSTER=${EcsCluster} > /etc/ecs/ecs.config
+            aws configure set region ${AWS::Region}
+            yum -y install nfs-utils
+            mkdir /mnt/efs
+            mount --verbose -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 "${EfsFileSystem}.efs.${AWS::Region}.amazonaws.com":/ /mnt/efs
+            chown -R 1000:1000 /mnt/efs
+            yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm -y
+            systemctl enable amazon-ssm-agent
+            systemctl start amazon-ssm-agent
+
+  EcsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${Project}-ecs-asg-${Environment}'
+      VPCZoneIdentifier: !Split [',', 'Fn::ImportValue': !Sub '${VpcStack}-Subnets${SubnetType}']
+      LaunchConfigurationName: !Ref EcsLaunchConfiguration
+      MinSize: '2'
+      MaxSize: '5'
+      DesiredCapacity: '2'
+      Tags: 
+        - Key: Name
+          Value: !Sub '${Project}-ecs-${Environment}'
+          PropagateAtLaunch: true
+    
+Outputs:
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'
+  EcsCluster:
+    Description: ECS Cluster
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-EcsCluster'
+  EcsSecurityGroup:
+    Description: ECS Host Security Group ID
+    Value: !Ref EcsHostSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroup'
+  EcsAutoScalingGroup:
+    Description: ECS Auto Scaling Group
+    Value: !Ref EcsAutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroup'

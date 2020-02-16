@@ -1,0 +1,42 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Resources related to the Jenkins Slaves'
+Parameters:
+  Project:
+    Description: 'Descriptive name that is used for Tags'
+    Type: String
+    Default: cicd
+  Environment:
+    Description: 'The environment of the resources, e.g dev'
+    Type: String
+    Default: dev
+  JenkinsMasterStack:
+    Description: 'The stack with the Jenkins master, DNS, Log Group, etc'
+    Type: String
+  JenkinsMasterJnlpPort:
+    Description: 'The default Jenkins JNLP that agents will connect to'
+    Type: 'Number'
+    Default: 50000
+Resources:
+  JenkinsSlaveTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${Project}-jenkins-slave-${Environment}'
+      ContainerDefinitions:
+        - Name: jenkins-slave
+          Image: jenkins/jnlp-slave:latest
+          Environment:
+            - Name: JENKINS_TUNNEL
+              Value:
+                Fn::Sub:
+                  - ${Host}:${JenkinsMasterJnlpPort}
+                  - Host: {'Fn::ImportValue': !Sub '${JenkinsMasterStack}-NetworkDNSName'}
+          Essential: true
+          Cpu: 512
+          Memory: 512
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                "Fn::Sub": '${JenkinsMasterStack}-LogGroup'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: jenkins-slave

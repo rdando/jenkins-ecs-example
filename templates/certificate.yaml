@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ACM Certificate Template
+Parameters:
+  Project:
+    Description: 'Descriptive name that is used for Tags'
+    Type: String
+    Default: cicd
+  Environment:
+    Description: 'The environment of the resources, e.g dev'
+    Type: String
+    Default: dev
+  DomainName:
+    Type: String
+    Description: The primary Domain for the certificate
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+  AlternativeDomainNames:
+    Type: String
+    Default: ''
+Conditions:
+  HasAlternativeDomainNames: !Not [!Equals [!Ref 'AlternativeDomainNames', '']]
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames: !If [HasAlternativeDomainNames, !Ref AlternativeDomainNames, !Ref 'AWS::NoValue']
+      ValidationMethod: DNS
+      Tags:
+      - Key: Name
+        Value: !Sub '${Project}-certificate-${Environment}'
+Outputs:
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'
+  Certificate:
+    Description: 'AWS Certificate Manager (ACM) certificate'
+    Value: !Ref Certificate
+    Export:
+      Name: !Sub '${AWS::StackName}-Certificate'
